@@ -1,45 +1,54 @@
 // Package uapi manages WireGuard peer configuration.
 // On Linux it uses the kernel module via the `wg` command (netlink).
-// On macOS it uses the wireguard-go userspace daemon's Unix socket.
+// On macOS it uses wireguard-go via `sudo -n wg`.
 package uapi
 
 import (
 	"fmt"
 	"os/exec"
+	"runtime"
 	"strings"
 )
 
-// PeerConfig describes a WireGuard peer endpoint to configure.
 type PeerConfig struct {
-	PublicKey    string
-	Endpoint     string // "ip:port"
-	AllowedIPs   string // comma-separated CIDRs, e.g. "10.200.200.2/32"
-	KeepAlive    int    // seconds, 0 = default
+	PublicKey  string
+	Endpoint   string
+	AllowedIPs string
+	KeepAlive  int
 }
 
-// Client manages WireGuard peer configuration on an interface.
 type Client struct {
-	iface string
+	iface    string
+	wgBinary string
 }
 
 func NewClient(interfaceName string) *Client {
-	return &Client{iface: interfaceName}
+	wgBin := "wg"
+	if runtime.GOOS == "darwin" {
+		wgBin = "/usr/bin/sudo -n /opt/homebrew/bin/wg"
+	}
+	return &Client{iface: interfaceName, wgBinary: wgBin}
 }
 
-// SetPeer adds or updates a peer using `wg set`.
-func (c *Client) SetPeer(cfg PeerConfig) error {
-	args := []string{"set", c.iface,
+func (c *Client) buildArgs(cfg PeerConfig) []string {
+	parts := strings.Fields(c.wgBinary)
+	args := append(parts[1:], "set", c.iface,
 		"peer", cfg.PublicKey,
 		"endpoint", cfg.Endpoint,
-	}
+	)
 	if cfg.AllowedIPs != "" {
 		args = append(args, "allowed-ips", cfg.AllowedIPs)
 	}
 	if cfg.KeepAlive > 0 {
 		args = append(args, "persistent-keepalive", fmt.Sprintf("%d", cfg.KeepAlive))
 	}
+	return args
+}
 
-	cmd := exec.Command("wg", args...)
+func (c *Client) SetPeer(cfg PeerConfig) error {
+	parts := strings.Fields(c.wgBinary)
+	args := c.buildArgs(cfg)
+	cmd := exec.Command(parts[0], args...)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("wg set peer: %s: %w", strings.TrimSpace(string(out)), err)
@@ -47,9 +56,10 @@ func (c *Client) SetPeer(cfg PeerConfig) error {
 	return nil
 }
 
-// RemovePeer removes a peer using `wg set <iface> peer <pk> remove`.
 func (c *Client) RemovePeer(publicKey string) error {
-	cmd := exec.Command("wg", "set", c.iface, "peer", publicKey, "remove")
+	parts := strings.Fields(c.wgBinary)
+	args := append(parts[1:], "set", c.iface, "peer", publicKey, "remove")
+	cmd := exec.Command(parts[0], args...)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("wg remove peer: %s: %w", strings.TrimSpace(string(out)), err)
@@ -57,9 +67,10 @@ func (c *Client) RemovePeer(publicKey string) error {
 	return nil
 }
 
-// ShowDump returns all peers in dump format.
 func (c *Client) ShowDump() (string, error) {
-	cmd := exec.Command("wg", "show", c.iface, "dump")
+	parts := strings.Fields(c.wgBinary)
+	args := append(parts[1:], "show", c.iface, "dump")
+	cmd := exec.Command(parts[0], args...)
 	out, err := cmd.Output()
 	if err != nil {
 		return "", fmt.Errorf("wg show dump: %w", err)

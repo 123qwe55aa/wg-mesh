@@ -1,0 +1,12 @@
+# Binaries
+wg-meshd-macos
+wg-meshd-linux
+wgm-*
+wm-*
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
