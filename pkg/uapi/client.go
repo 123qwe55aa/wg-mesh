@@ -5,6 +5,7 @@ package uapi
 
 import (
 	"fmt"
+	"os"
 	"os/exec"
 	"runtime"
 	"strings"
@@ -25,7 +26,17 @@ type Client struct {
 func NewClient(interfaceName string) *Client {
 	wgBin := "wg"
 	if runtime.GOOS == "darwin" {
-		wgBin = "/usr/bin/sudo -n /opt/homebrew/bin/wg"
+		// Find wg binary in common locations
+		for _, p := range []string{"/opt/homebrew/bin/wg", "/opt/homebrew/sbin/wg", "/usr/local/bin/wg", "/Users/toby/.local/bin/wg"} {
+			if _, err := os.Stat(p); err == nil {
+				wgBin = "/usr/bin/sudo -n " + p
+				break
+			}
+		}
+		// Fallback to just "wg" in PATH
+		if wgBin == "wg" {
+			wgBin = "/usr/bin/sudo -n wg"
+		}
 	}
 	return &Client{iface: interfaceName, wgBinary: wgBin}
 }
