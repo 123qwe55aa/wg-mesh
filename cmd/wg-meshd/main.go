@@ -36,6 +36,7 @@ func main() {
 		meshPort    = flag.Int("mesh-port", 51821, "Mesh control (PEX/DHT) UDP port")
 		stunAddr    = flag.String("stun", "stun.l.google.com:19302", "STUN server address")
 		seedPeers   = flag.String("seed", "", "Comma-separated seed peers (publickey@ip:port)")
+		vpsAddr     = flag.String("vps", "", "VPS public address for WireGuard endpoint (ip:port), e.g. 175.178.118.76:51820")
 		interfaceName = flag.String("interface", "wg0", "WireGuard interface name")
 	)
 	flag.Parse()
@@ -131,16 +132,20 @@ func main() {
 						Endpoint:  ep,
 					})
 					slog.Info("added seed peer", "pk", pk[:16]+"...", "ep", ep)
-					// 立即加到 WireGuard：Mac 主动发起握手 → 打洞
+					// 立即加到 WireGuard：用 VPS 公开 WG 地址打洞
+					wgEp := ep
+					if *vpsAddr != "" {
+						wgEp = *vpsAddr
+					}
 					if err := uapiClient.SetPeer(uapi.PeerConfig{
 						PublicKey: pk,
-						Endpoint:  ep,
+						Endpoint:  wgEp,
 						AllowedIPs: "10.200.200.0/24",
 						KeepAlive: 25,
 					}); err != nil {
 						slog.Warn("failed to add seed to wireguard", "error", err)
 					} else {
-						slog.Info("seed peer added to wireguard", "pk", pk[:16]+"...")
+						slog.Info("seed peer added to wireguard", "pk", pk[:16]+"...", "ep", wgEp)
 					}
 				}
 			}
