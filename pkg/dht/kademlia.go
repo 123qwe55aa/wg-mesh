@@ -292,8 +292,18 @@ func (t *Table) insert(c Contact) {
 	bucket := t.buckets[bucketIdx]
 	bucket.mu.Lock()
 	defer bucket.mu.Unlock()
-	for _, existing := range bucket.contacts {
+	for i, existing := range bucket.contacts {
 		if existing.ID == c.ID {
+			// Update existing contact with latest endpoint info
+			bucket.contacts[i].Endpoint = c.Endpoint
+			if c.PublicEndpoint != "" {
+				bucket.contacts[i].PublicEndpoint = c.PublicEndpoint
+			}
+			t.log.Debug("dht updated contact",
+				"id", c.ID[:8],
+				"ep", c.Endpoint,
+				"public_ep", c.PublicEndpoint,
+			)
 			return
 		}
 	}
