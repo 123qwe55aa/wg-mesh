@@ -38,7 +38,7 @@ func main() {
 	var (
 		publicKey   = flag.String("public-key", "", "WireGuard public key of this node")
 		meshPort    = flag.Int("mesh-port", 51821, "Mesh control (PEX/DHT) TCP port")
-		stunAddr    = flag.String("stun", "stun.l.google.com:19302", "STUN server address")
+		stunAddr    = flag.String("stun", "stun.miwifi.com:3478", "STUN server address")
 		seedPeers   = flag.String("seed", "", "Comma-separated seed peers (publickey@ip:port)")
 		vpsAddr     = flag.String("vps", "", "VPS public address for WireGuard endpoint (ip:port), e.g. 175.178.118.76:51820")
 		interfaceName = flag.String("interface", "wg0", "WireGuard interface name")
@@ -139,7 +139,10 @@ func main() {
 		if err != nil || stunResult == nil || stunResult.PublicIP == nil {
 			// Fallback: STUN on a separate port to at least get the public IP.
 			// The port will be the WG internal port (may differ from CGNAT mapping).
-			slog.Debug("wg-port STUN unavailable, fallback to separate-port STUN", "error", err)
+			slog.Warn("STUN failed — DHT will register via TCP address fallback",
+				"wg_port", wgPort,
+				"error", err,
+			)
 			stunConn2, err2 := net.ListenUDP("udp", &net.UDPAddr{Port: *meshPort + 10})
 			if err2 == nil {
 				stunResult, err2 = nat.DiscoverPublic(*stunAddr, stunConn2)
@@ -165,9 +168,15 @@ func main() {
 				"nat_type", stunNATType,
 			)
 		}
+	// If STUN failed entirely and --wg-endpoint was not explicitly set,
+	// clear localWgEp so DHT sends no WgEndpoint. Hub will use the TCP
+	// connection's source address as fallback in handleFindNode.
+	if *wgEndpoint == "" && publicWgEp == "" {
+		localWgEp = ""
 	}
+}
 
-	// 4. Initialize DHT for bootstrap discovery (different port from PEX)
+// 4. Initialize DHT for bootstrap discovery (different port from PEX)
 	dhtNode, err := dht.NewDHT(*publicKey, *meshPort+1, localWgEp)
 	if err != nil {
 		slog.Error("failed to create dht", "error", err)
