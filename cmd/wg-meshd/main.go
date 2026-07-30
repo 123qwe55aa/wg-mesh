@@ -286,7 +286,28 @@ func main() {
 
 	slog.Info("wg-meshd running")
 
-	// 8. Handshake monitor: remove P2P peers when stale, fallback to VPS hub relay
+	// Signal channel for graceful shutdown (used by refresh and monitor goroutines)
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+
+	// 8. Periodic DHT refresh: re-query known peers to pick up endpoint changes.
+	// When a peer reconnects from a different network, the hub updates its contact.
+	// Without periodic refresh, other peers would keep using the stale endpoint.
+	go func() {
+		refreshTicker := time.NewTicker(5 * time.Minute)
+		defer refreshTicker.Stop()
+		for {
+			select {
+			case <-refreshTicker.C:
+				slog.Debug("dht refresh cycle starting")
+				dhtNode.Refresh()
+			case <-sigCh:
+				return
+			}
+		}
+	}()
+
+	// 9. Handshake monitor: remove P2P peers when stale, fallback to VPS hub relay
 	if *relayAddr != "" && vpsHubPubKey != "" {
 		slog.Info("handshake monitor started",
 			"vps_hub_pk", vpsHubPubKey[:16]+"...",
@@ -301,8 +322,6 @@ func main() {
 	}
 
 	// Wait for signal
-	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 	<-sigCh
 
 	slog.Info("shutting down")

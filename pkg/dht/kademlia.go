@@ -191,6 +191,15 @@ func (d *DHT) handleFindNode(conn net.Conn, msg *DhtMessage) {
 		PublicEndpoint: msg.PublicEndpoint,
 	}
 	d.table.insert(contact)
+	// Fire callback on the responder side (hub) so peer registrations are visible
+	if d.onPeerDiscovered != nil && msg.PublicKey != "" && msg.PublicKey != d.publicKey {
+		d.log.Info("dht hub registered peer update",
+			"pk", msg.PublicKey[:16],
+			"ep", ep,
+			"public_ep", msg.PublicEndpoint,
+		)
+		d.onPeerDiscovered(contact)
+	}
 	closest := d.table.closest(msg.TargetID, kBucketSize)
 	resp := DhtMessage{Type: MsgFindNodeResp, SenderID: d.table.selfID, Contacts: closest}
 	enc := gob.NewEncoder(conn)
@@ -281,6 +290,23 @@ func (d *DHT) KnownPeers() []Contact {
 		bucket.mu.Unlock()
 	}
 	return all
+}
+
+// Refresh re-queries the DHT for all known peers.
+// This picks up endpoint changes from peers that re-registered with new addresses.
+// Call periodically (e.g., every 5 minutes) from the main loop.
+func (d *DHT) Refresh() {
+	d.log.Debug("dht refresh started")
+	for _, contact := range d.KnownPeers() {
+		// Skip self
+		if contact.PublicKey == "" || contact.PublicKey == d.publicKey {
+			continue
+		}
+		// Re-query for our own ID through a known contact (usually the hub)
+		// The hub returns the latest contacts including any updated endpoints
+		d.findNode(d.table.selfID, contact)
+	}
+	d.log.Debug("dht refresh completed")
 }
 
 func (t *Table) insert(c Contact) {
