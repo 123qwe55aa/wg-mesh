@@ -209,6 +209,8 @@ func main() {
 				"lan_ep", c.Endpoint,
 				"public_ep", c.PublicEndpoint,
 			)
+			// Report connection state to hub for cross-network visibility
+			dhtNode.SendState(c.PublicKey, "connected", wgEp)
 		}
 	})
 

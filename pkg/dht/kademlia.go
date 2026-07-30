@@ -68,6 +68,7 @@ type DHT struct {
 	publicKey      string
 	wgEndpoint     string // this node's WireGuard endpoint (ip:port)
 	publicEndpoint string // this node's STUN-discovered public address (ip:port), for NAT traversal
+	seedContact    Contact // first seed contact, used for peer state reporting
 	listener       net.Listener
 	log            *slog.Logger
 	stopCh         chan struct{}
@@ -79,6 +80,7 @@ const (
 	MsgFindNodeResp
 	MsgPing
 	MsgPong
+	MsgReportState
 )
 
 type DhtMessage struct {
@@ -89,6 +91,7 @@ type DhtMessage struct {
 	PublicKey      string // sender's WireGuard public key
 	WgEndpoint     string // sender's WireGuard endpoint (ip:port)
 	PublicEndpoint string // sender's STUN-discovered public address (ip:port)
+	State          string // peer connection state: "p2p", "relay", "disconnected"
 }
 
 func NewDHT(publicKey string, listenPort int, wgEndpoint string) (*DHT, error) {
@@ -175,6 +178,8 @@ func (d *DHT) handleConn(conn net.Conn) {
 		d.handleFindNode(conn, &msg)
 	case MsgPing:
 		d.handlePing(conn)
+	case MsgReportState:
+		d.handleReportState(&msg)
 	}
 }
 
@@ -237,6 +242,26 @@ func (d *DHT) handlePing(conn net.Conn) {
 	enc.Encode(resp)
 }
 
+// handleReportState logs a peer state report received from another peer.
+// The state indicates the peer's connection status: "p2p", "relay", or "disconnected".
+func (d *DHT) handleReportState(msg *DhtMessage) {
+	if len(msg.SenderID) >= 8 && len(msg.TargetID) >= 8 {
+		d.log.Info("dht peer state report",
+			"from", msg.SenderID[:8],
+			"peer", msg.TargetID[:8],
+			"state", msg.State,
+			"endpoint", msg.WgEndpoint,
+		)
+	} else {
+		d.log.Info("dht peer state report",
+			"from", msg.SenderID,
+			"peer", msg.TargetID,
+			"state", msg.State,
+			"endpoint", msg.WgEndpoint,
+		)
+	}
+}
+
 func (d *DHT) Bootstrap(seeds []Contact) {
 	for _, seed := range seeds {
 		if len(seed.ID) >= 8 {
@@ -245,8 +270,46 @@ func (d *DHT) Bootstrap(seeds []Contact) {
 			d.log.Info("dht bootstrap to seed", "id", seed.ID, "ep", seed.Endpoint)
 		}
 		d.table.insert(seed)
+		// Store first seed for state reporting
+		if d.seedContact.PublicKey == "" {
+			d.seedContact = seed
+		}
 		d.findNode(d.table.selfID, seed)
 	}
+}
+
+// SendState reports a peer connection state to the hub/seed.
+// Called when a peer's connection status changes (p2p, relay, disconnected).
+func (d *DHT) SendState(peerPubKey, state, endpoint string) {
+	if d.seedContact.PublicKey == "" {
+		d.log.Debug("dht send_state skipped: no seed contact")
+		return
+	}
+	peerID := NodeID(peerPubKey)
+	msg := DhtMessage{
+		Type:       MsgReportState,
+		SenderID:   d.table.selfID,
+		TargetID:   peerID,
+		PublicKey:  d.publicKey,
+		WgEndpoint: endpoint,
+		State:      state,
+	}
+	conn, err := net.DialTimeout("tcp", d.seedContact.Endpoint, 10*time.Second)
+	if err != nil {
+		d.log.Warn("dht send_state connect failed", "error", err)
+		return
+	}
+	defer conn.Close()
+	enc := gob.NewEncoder(conn)
+	if err := enc.Encode(msg); err != nil {
+		d.log.Warn("dht send_state encode failed", "error", err)
+		return
+	}
+	d.log.Debug("dht state sent",
+		"peer", peerID[:8],
+		"state", state,
+		"ep", endpoint,
+	)
 }
 
 func (d *DHT) findNode(targetID string, contact Contact) {
