@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"runtime"
+	"strconv"
 	"strings"
 )
 
@@ -18,6 +19,18 @@ type PeerConfig struct {
 	KeepAlive  int
 }
 
+// PeerInfo contains parsed information about a WireGuard peer from dump output.
+type PeerInfo struct {
+	PublicKey           string
+	PresharedKey        string // "(none)" if not set
+	Endpoint            string
+	AllowedIPs          string
+	LatestHandshake     int64 // unix timestamp, 0 if never
+	TransferRx          int64
+	TransferTx          int64
+	PersistentKeepalive int
+}
+
 type Client struct {
 	iface    string
 	wgBinary string
@@ -26,8 +39,15 @@ type Client struct {
 func NewClient(interfaceName string) *Client {
 	wgBin := "wg"
 	if runtime.GOOS == "darwin" {
-		// Find wg binary in common locations
-		for _, p := range []string{"/opt/homebrew/bin/wg", "/opt/homebrew/sbin/wg", "/usr/local/bin/wg", "/Users/toby/.local/bin/wg"} {
+		// Find wg binary in common locations.
+		// ~/.local/bin/wg first — it's the user-managed location with proper sudoers.
+		home, _ := os.UserHomeDir()
+		for _, p := range []string{
+			home + "/.local/bin/wg",
+			"/opt/homebrew/bin/wg",
+			"/opt/homebrew/sbin/wg",
+			"/usr/local/bin/wg",
+		} {
 			if _, err := os.Stat(p); err == nil {
 				wgBin = "/usr/bin/sudo -n " + p
 				break
@@ -87,4 +107,51 @@ func (c *Client) ShowDump() (string, error) {
 		return "", fmt.Errorf("wg show dump: %w", err)
 	}
 	return string(out), nil
+}
+
+// ListPeers returns all peers with their current status from wg show dump.
+func (c *Client) ListPeers() ([]PeerInfo, error) {
+	dump, err := c.ShowDump()
+	if err != nil {
+		return nil, err
+	}
+	lines := strings.Split(strings.TrimSpace(dump), "\n")
+	if len(lines) < 2 {
+		// Only the interface line, no peers
+		return nil, nil
+	}
+	var peers []PeerInfo
+	for _, line := range lines[1:] {
+		parts := strings.Split(line, "	")
+		if len(parts) < 8 {
+			continue
+		}
+		hs, _ := strconv.ParseInt(parts[4], 10, 64)
+		rx, _ := strconv.ParseInt(parts[5], 10, 64)
+		tx, _ := strconv.ParseInt(parts[6], 10, 64)
+		ka, _ := strconv.Atoi(parts[7])
+		peers = append(peers, PeerInfo{
+			PublicKey:           parts[0],
+			PresharedKey:        parts[1],
+			Endpoint:            parts[2],
+			AllowedIPs:          parts[3],
+			LatestHandshake:     hs,
+			TransferRx:          rx,
+			TransferTx:          tx,
+			PersistentKeepalive: ka,
+		})
+	}
+	return peers, nil
+}
+
+// SetEndpoint changes only the endpoint for an existing peer.
+func (c *Client) SetEndpoint(publicKey, endpoint string) error {
+	parts := strings.Fields(c.wgBinary)
+	args := append(parts[1:], "set", c.iface, "peer", publicKey, "endpoint", endpoint)
+	cmd := exec.Command(parts[0], args...)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("wg set endpoint: %s: %w", strings.TrimSpace(string(out)), err)
+	}
+	return nil
 }

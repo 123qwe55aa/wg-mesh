@@ -15,13 +15,16 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"log/slog"
 	"net"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
+	"time"
 
 	"github.com/123qwe55aa/wg-mesh/pkg/dht"
 	"github.com/123qwe55aa/wg-mesh/pkg/mesh"
@@ -38,6 +41,11 @@ func main() {
 		seedPeers   = flag.String("seed", "", "Comma-separated seed peers (publickey@ip:port)")
 		vpsAddr     = flag.String("vps", "", "VPS public address for WireGuard endpoint (ip:port), e.g. 175.178.118.76:51820")
 		interfaceName = flag.String("interface", "wg0", "WireGuard interface name")
+		wgEndpoint  = flag.String("wg-endpoint", "", "This node's WireGuard endpoint (ip:port) for DHT discovery. If empty, falls back to --vps value")
+		relayAddr   = flag.String("relay", "", "VPS relay endpoint for fallback when P2P fails (ip:port), e.g. 175.178.118.76:51820")
+		hsTimeout   = flag.Duration("handshake-timeout", 2*time.Minute, "Handshake age threshold before removing P2P peer (0 = auto)")
+		hsInterval  = flag.Duration("handshake-interval", 15*time.Second, "How often to check peer handshake status")
+		restoreIntv = flag.Duration("restore-interval", 5*time.Minute, "How often to try restoring P2P peer from relay")
 	)
 	flag.Parse()
 
@@ -92,8 +100,14 @@ func main() {
 		pexProto = nil
 	}
 
+	// Resolve WG endpoint for DHT discovery
+	localWgEp := *wgEndpoint
+	if localWgEp == "" {
+		localWgEp = *vpsAddr
+	}
+
 	// 4. Initialize DHT for bootstrap discovery (different port from PEX)
-	dhtNode, err := dht.NewDHT(*publicKey, *meshPort+1)
+	dhtNode, err := dht.NewDHT(*publicKey, *meshPort+1, localWgEp)
 	if err != nil {
 		slog.Error("failed to create dht", "error", err)
 		os.Exit(1)
@@ -104,11 +118,13 @@ func main() {
 		if c.PublicKey == "" {
 			return
 		}
-		// 用 DHT 的 endpoint 配置 peer，Mac 主动握手
+		// 用 DHT 的 endpoint 配置 peer
+		// AllowedIPs 留空：WireGuard 会保留已有的 VPS hub /24 路由
+		// 用户可手动添加 /32 实现 P2P 直连
 		if err := uapiClient.SetPeer(uapi.PeerConfig{
 			PublicKey:  c.PublicKey,
 			Endpoint:   c.Endpoint,
-			AllowedIPs: "10.200.200.0/24",
+			AllowedIPs: "",
 			KeepAlive:  25,
 		}); err != nil {
 			slog.Warn("failed to add dht peer to wireguard", "pk", c.PublicKey[:16], "error", err)
@@ -175,6 +191,36 @@ func main() {
 
 	slog.Info("wg-meshd running")
 
+	// 8. Handshake monitor: remove P2P peers when stale, fallback to VPS hub relay
+	if *relayAddr != "" {
+		// --relay flag given, but we need the VPS hub's public key from the seed.
+		// Find it from the seed list: extract the pubkey from seed entries.
+		vpsHubPubKey := ""
+		if *seedPeers != "" {
+			for _, s := range splitAndTrim(*seedPeers, ",") {
+				parts := split(s, "@")
+				if len(parts) == 2 && parts[0] != "" {
+					vpsHubPubKey = stringsTrim(parts[0])
+					break
+				}
+			}
+		}
+		if vpsHubPubKey == "" {
+			slog.Warn("relay fallback enabled but could not determine VPS hub public key from --seed")
+		} else {
+			slog.Info("handshake monitor started",
+				"vps_hub_pk", vpsHubPubKey[:16]+"...",
+				"timeout", *hsTimeout,
+				"interval", *hsInterval,
+			)
+			relayCtx, relayCancel := context.WithCancel(context.Background())
+			go runHandshakeMonitor(relayCtx, uapiClient, vpsHubPubKey, *hsTimeout, *hsInterval, *restoreIntv, state)
+			defer relayCancel()
+		}
+	} else {
+		slog.Info("relay fallback disabled (no --relay)")
+	}
+
 	// Wait for signal
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
@@ -183,6 +229,157 @@ func main() {
 	slog.Info("shutting down")
 	pexProto.Stop()
 	dhtNode.Stop()
+}
+
+// runHandshakeMonitor periodically checks P2P peer handshake health.
+// When a P2P peer's handshake is stale (>timeout), remove the /32 peer so
+// traffic falls back to the VPS hub relay (10.200.200.0/24).
+//
+// Periodically try re-adding P2P peers. DHT/PEX will also re-discover them.
+func runHandshakeMonitor(
+	ctx context.Context,
+	client *uapi.Client,
+	vpsHubPubKey string, // VPS hub's public key — never remove this one
+	timeout time.Duration,
+	interval time.Duration,
+	restoreInterval time.Duration,
+	state *mesh.State,
+) {
+	// Track removed P2P peers for restoration
+	type savedPeer struct {
+		PublicKey  string
+		Endpoint   string
+		AllowedIPs string
+		KeepAlive  int
+		removedAt  time.Time
+	}
+	savedPeers := make(map[string]*savedPeer)
+
+	check := func() {
+		peers, err := client.ListPeers()
+		if err != nil {
+			slog.Warn("handshake monitor: list peers failed", "error", err)
+			return
+		}
+
+		now := time.Now().Unix()
+
+		// Phase 1: Check existing peers for stale handshakes
+		for _, p := range peers {
+			// Skip the VPS hub itself
+			if p.PublicKey == vpsHubPubKey {
+				continue
+			}
+			// Skip peers without a valid endpoint or handshake
+			if p.Endpoint == "" || p.Endpoint == "(none)" || p.LatestHandshake == 0 {
+				continue
+			}
+			// Skip peers not using a /32 (these are not P2P peers)
+			if !strings.Contains(p.AllowedIPs, "/32") {
+				continue
+			}
+
+			age := now - p.LatestHandshake
+			// Check if already tracked as stale
+			if _, exists := savedPeers[p.PublicKey]; exists {
+				continue
+			}
+
+			if age > int64(timeout.Seconds()) {
+				slog.Warn("P2P handshake stale, removing peer (traffic will use VPS hub relay)",
+					"pk", p.PublicKey[:16],
+					"age", age,
+					"old_endpoint", p.Endpoint,
+					"allowed_ips", p.AllowedIPs,
+				)
+				// Save before removing
+				savedPeers[p.PublicKey] = &savedPeer{
+					PublicKey:  p.PublicKey,
+					Endpoint:   p.Endpoint,
+					AllowedIPs: p.AllowedIPs,
+					KeepAlive:  p.PersistentKeepalive,
+					removedAt:  time.Now(),
+				}
+				if err := client.RemovePeer(p.PublicKey); err != nil {
+					slog.Warn("failed to remove P2P peer", "error", err)
+					delete(savedPeers, p.PublicKey)
+					continue
+				}
+				state.UpsertPeer(p.PublicKey, func(ps *mesh.PeerState) {
+					ps.IsConnected = false
+				})
+			}
+		}
+
+		// Phase 2: Try restoring removed P2P peers
+		for pk, sp := range savedPeers {
+			if time.Since(sp.removedAt) < restoreInterval/2 {
+				continue
+			}
+			// Try adding the peer back
+			slog.Info("attempting to restore P2P peer",
+				"pk", pk[:16],
+				"endpoint", sp.Endpoint,
+			)
+			if err := client.SetPeer(uapi.PeerConfig{
+				PublicKey:  sp.PublicKey,
+				Endpoint:   sp.Endpoint,
+				AllowedIPs: sp.AllowedIPs,
+				KeepAlive:  sp.KeepAlive,
+			}); err != nil {
+				slog.Warn("failed to restore P2P peer, will retry", "error", err)
+				continue
+			}
+			// Don't remove from savedPeers yet — next cycle will check handshake
+			sp.removedAt = time.Now()
+		}
+
+		// Phase 3: restored peers will be re-checked in next cycle's Phase 1.
+		// If handshake is healthy, next cycle won't see them as stale and will
+		// implicitly "forget" them.
+		// We clean up savedPeers by checking if any tracked peer no longer exists
+		// in the current list (it was re-added but then re-removed by DHT/PEX).
+		type active struct{}
+		activeKeys := make(map[string]active)
+		for _, p := range peers {
+			activeKeys[p.PublicKey] = active{}
+		}
+		for pk := range savedPeers {
+			if _, exists := activeKeys[pk]; !exists {
+				// Peer was removed by something else, clean up tracking
+				slog.Debug("removed stale peer tracking (no longer in wg)", "pk", pk[:16])
+				delete(savedPeers, pk)
+			}
+		}
+	}
+
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	// Run once immediately
+	check()
+
+	for {
+		select {
+		case <-ctx.Done():
+			slog.Info("handshake monitor stopped")
+			return
+		case <-ticker.C:
+			check()
+		}
+	}
+}
+
+func isExpired(t time.Time, d time.Duration) bool {
+	return time.Since(t) >= d
+}
+
+// splitHost extracts host from "host:port" or returns the string as-is.
+func splitHost(hostport string) string {
+	if h, _, err := net.SplitHostPort(hostport); err == nil {
+		return h
+	}
+	return hostport
 }
 
 func splitAndTrim(s, sep string) []string {

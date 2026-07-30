@@ -65,6 +65,7 @@ type Table struct {
 type DHT struct {
 	table     *Table
 	publicKey string
+	wgEndpoint string // this node's WireGuard endpoint (ip:port)
 	listener  net.Listener
 	log       *slog.Logger
 	stopCh    chan struct{}
@@ -79,13 +80,15 @@ const (
 )
 
 type DhtMessage struct {
-	Type     uint8
-	SenderID string
-	TargetID string
-	Contacts []Contact
+	Type       uint8
+	SenderID   string
+	TargetID   string
+	Contacts   []Contact
+	PublicKey  string // sender's WireGuard public key
+	WgEndpoint string // sender's WireGuard endpoint (ip:port)
 }
 
-func NewDHT(publicKey string, listenPort int) (*DHT, error) {
+func NewDHT(publicKey string, listenPort int, wgEndpoint string) (*DHT, error) {
 	l, err := net.Listen("tcp", fmt.Sprintf("0.0.0.0:%d", listenPort))
 	if err != nil {
 		return nil, fmt.Errorf("dht listen: %w", err)
@@ -100,11 +103,12 @@ func NewDHT(publicKey string, listenPort int) (*DHT, error) {
 		table.buckets[i] = &KBucket{}
 	}
 	return &DHT{
-		table:     table,
-		publicKey: publicKey,
-		listener:  l,
-		log:       slog.With("module", "dht"),
-		stopCh:    make(chan struct{}),
+		table:      table,
+		publicKey:  publicKey,
+		wgEndpoint: wgEndpoint,
+		listener:   l,
+		log:        slog.With("module", "dht"),
+		stopCh:     make(chan struct{}),
 	}, nil
 }
 
@@ -164,8 +168,15 @@ func (d *DHT) handleConn(conn net.Conn) {
 }
 
 func (d *DHT) handleFindNode(conn net.Conn, msg *DhtMessage) {
+	ep := msg.WgEndpoint
+	if ep == "" {
+		// fallback: use the TCP connection address (DHT port, not ideal)
+		ep = conn.RemoteAddr().String()
+	}
 	d.table.insert(Contact{
-		ID: msg.SenderID, Endpoint: conn.RemoteAddr().String(),
+		ID:        msg.SenderID,
+		PublicKey: msg.PublicKey,
+		Endpoint:  ep,
 	})
 	closest := d.table.closest(msg.TargetID, kBucketSize)
 	resp := DhtMessage{Type: MsgFindNodeResp, SenderID: d.table.selfID, Contacts: closest}
@@ -177,8 +188,12 @@ func (d *DHT) handleFindNodeResp(msg *DhtMessage) {
 	for _, c := range msg.Contacts {
 		if c.ID != d.table.selfID {
 			d.table.insert(c)
-			d.log.Info("dht discovered peer", "id", c.ID[:8], "pk", c.PublicKey[:16], "ep", c.Endpoint)
-			if d.onPeerDiscovered != nil {
+			if len(c.PublicKey) >= 16 {
+				d.log.Info("dht discovered peer", "id", c.ID[:8], "pk", c.PublicKey[:16], "ep", c.Endpoint)
+			} else {
+				d.log.Debug("dht discovered peer (incomplete)", "id", c.ID[:8], "ep", c.Endpoint)
+			}
+			if d.onPeerDiscovered != nil && c.PublicKey != "" {
 				d.onPeerDiscovered(c)
 			}
 		}
@@ -193,7 +208,11 @@ func (d *DHT) handlePing(conn net.Conn) {
 
 func (d *DHT) Bootstrap(seeds []Contact) {
 	for _, seed := range seeds {
-		d.log.Info("dht bootstrap to seed", "id", seed.ID[:8], "ep", seed.Endpoint)
+		if len(seed.ID) >= 8 {
+			d.log.Info("dht bootstrap to seed", "id", seed.ID[:8], "ep", seed.Endpoint)
+		} else {
+			d.log.Info("dht bootstrap to seed", "id", seed.ID, "ep", seed.Endpoint)
+		}
 		d.table.insert(seed)
 		d.findNode(d.table.selfID, seed)
 	}
@@ -207,7 +226,13 @@ func (d *DHT) findNode(targetID string, contact Contact) {
 	}
 	defer conn.Close()
 
-	msg := DhtMessage{Type: MsgFindNode, SenderID: d.table.selfID, TargetID: targetID}
+	msg := DhtMessage{
+		Type:       MsgFindNode,
+		SenderID:   d.table.selfID,
+		TargetID:   targetID,
+		PublicKey:  d.publicKey,
+		WgEndpoint: d.wgEndpoint,
+	}
 	enc := gob.NewEncoder(conn)
 	if err := enc.Encode(msg); err != nil {
 		return
