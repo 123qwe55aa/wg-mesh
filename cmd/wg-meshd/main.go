@@ -10,7 +10,7 @@
 //	                                               │
 //	                             ┌─────────────────┼─────────────────┐
 //	                             │                 │                 │
-//	                         PEX UDP           DHT UDP          STUN UDP
+//	                         PEX TCP           DHT TCP            STUN
 //	                     (peer exchange)   (bootstrap)      (NAT traversal)
 package main
 
@@ -22,6 +22,7 @@ import (
 	"net"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -36,13 +37,14 @@ import (
 func main() {
 	var (
 		publicKey   = flag.String("public-key", "", "WireGuard public key of this node")
-		meshPort    = flag.Int("mesh-port", 51821, "Mesh control (PEX/DHT) UDP port")
+		meshPort    = flag.Int("mesh-port", 51821, "Mesh control (PEX/DHT) TCP port")
 		stunAddr    = flag.String("stun", "stun.l.google.com:19302", "STUN server address")
 		seedPeers   = flag.String("seed", "", "Comma-separated seed peers (publickey@ip:port)")
 		vpsAddr     = flag.String("vps", "", "VPS public address for WireGuard endpoint (ip:port), e.g. 175.178.118.76:51820")
 		interfaceName = flag.String("interface", "wg0", "WireGuard interface name")
 		wgEndpoint  = flag.String("wg-endpoint", "", "This node's WireGuard endpoint (ip:port) for DHT discovery. If empty, falls back to --vps value")
 		relayAddr   = flag.String("relay", "", "VPS relay endpoint for fallback when P2P fails (ip:port), e.g. 175.178.118.76:51820")
+		hubIntraIP = flag.String("hub-intra-ip", "", "VPS hub internal mesh IP for DHT fallback when public IP is blocked (e.g. 10.200.200.1)")
 		hsTimeout   = flag.Duration("handshake-timeout", 2*time.Minute, "Handshake age threshold before removing P2P peer (0 = auto)")
 		hsInterval  = flag.Duration("handshake-interval", 15*time.Second, "How often to check peer handshake status")
 		restoreIntv = flag.Duration("restore-interval", 5*time.Minute, "How often to try restoring P2P peer from relay")
@@ -90,7 +92,7 @@ func main() {
 			return uapiClient.SetPeer(uapi.PeerConfig{
 				PublicKey:  pk,
 				Endpoint:   endpoint,
-							AllowedIPs: "",
+				AllowedIPs: "",
 				KeepAlive:  25,
 			})
 		},
@@ -102,6 +104,69 @@ func main() {
 
 	// Resolve WG endpoint for DHT discovery
 	localWgEp := *wgEndpoint
+
+	// If --wg-endpoint not explicitly set, auto-discover public endpoint via STUN
+	if *wgEndpoint == "" {
+		// Get the local WireGuard listen port from wg show
+		wgDump, err := uapiClient.ShowDump()
+		var wgPort int
+		if err == nil {
+			lines := strings.Split(strings.TrimSpace(wgDump), "\n")
+			if len(lines) > 0 {
+				parts := strings.Split(lines[0], "	")
+				if len(parts) >= 3 {
+					wgPort, _ = strconv.Atoi(strings.TrimSpace(parts[2]))
+				}
+			}
+		}
+		if wgPort == 0 {
+			wgPort = *meshPort // fallback: use mesh port as WG port hint
+		}
+
+		// Try STUN on the actual WG port via SO_REUSEPORT first.
+		// This gives the exact CGNAT mapping (port and IP) when supported.
+		var stunResult *nat.StunResult
+		stunConn, err := reusableListenUDP(wgPort)
+		if err == nil {
+			stunResult, err = nat.DiscoverPublic(*stunAddr, stunConn)
+			stunConn.Close()
+		}
+		if err != nil || stunResult == nil || stunResult.PublicIP == nil {
+			// Fallback: STUN on a separate port to at least get the public IP.
+			// The port will be the WG internal port (may differ from CGNAT mapping).
+			slog.Debug("wg-port STUN unavailable, fallback to separate-port STUN", "error", err)
+			stunConn2, err2 := net.ListenUDP("udp", &net.UDPAddr{Port: *meshPort + 10})
+			if err2 == nil {
+				stunResult, err2 = nat.DiscoverPublic(*stunAddr, stunConn2)
+				stunConn2.Close()
+				if err2 == nil && stunResult != nil && stunResult.PublicIP != nil {
+					// We have the correct public IP; use WG internal port as endpoint.
+					// NAT3's endpoint-independent mapping means the CGNAT port differs,
+					// but the IP is correct — hub relay fallback handles the port mismatch.
+					localWgEp = net.JoinHostPort(stunResult.PublicIP.String(), strconv.Itoa(wgPort))
+					slog.Info("auto-discovered public IP from STUN",
+						"endpoint", localWgEp,
+						"nat_type", stunResult.NATType,
+						"wg_port", wgPort,
+					)
+				}
+			}
+		} else {
+			// REUSEPORT succeeded — we have the exact CGNAT mapping (IP + port)
+			localWgEp = net.JoinHostPort(stunResult.PublicIP.String(), strconv.Itoa(stunResult.PublicPort))
+			slog.Info("auto-discovered public WG endpoint from STUN",
+				"endpoint", localWgEp,
+				"nat_type", stunResult.NATType,
+			)
+		}
+
+		if localWgEp == "" {
+			slog.Warn("STUN discovery failed, falling back to --vps as DHT endpoint",
+				"vps", *vpsAddr,
+			)
+			localWgEp = *vpsAddr
+		}
+	}
 	if localWgEp == "" {
 		localWgEp = *vpsAddr
 	}
@@ -133,17 +198,21 @@ func main() {
 		}
 	})
 
-	// 5. Parse seed peers
+	// 5. Parse seed peers (public DHT)
+	var seeds []dht.Contact
+	var vpsHubPubKey string
 	if *seedPeers != "" {
-		var seeds []dht.Contact
 		for _, s := range splitAndTrim(*seedPeers, ",") {
 			parts := split(s, "@")
 			if len(parts) == 2 {
 				pk := stringsTrim(parts[0])
 				ep := stringsTrim(parts[1])
 				if pk != "" && ep != "" {
+					if vpsHubPubKey == "" {
+						vpsHubPubKey = pk
+					}
 					seeds = append(seeds, dht.Contact{
-						ID:       dht.NodeID(pk),
+						ID:        dht.NodeID(pk),
 						PublicKey: pk,
 						Endpoint:  ep,
 					})
@@ -171,54 +240,50 @@ func main() {
 		}
 	}
 
+	// 5b. DHT fallback via WG tunnel IP
+	// If the public DHT seed is unreachable (CGNAT blocking TCP), retry via the
+	// hub's internal mesh IP (10.200.200.1) through the existing WG tunnel.
+	if *hubIntraIP != "" && vpsHubPubKey != "" {
+		// Derive DHT port from the seed endpoint (same port, different IP)
+		seedDhtPort := ""
+		if len(seeds) > 0 {
+			_, port, err := net.SplitHostPort(seeds[0].Endpoint)
+			if err == nil {
+				seedDhtPort = port
+			}
+		}
+		if seedDhtPort != "" {
+			intraEp := net.JoinHostPort(*hubIntraIP, seedDhtPort)
+			slog.Info("adding DHT fallback via WG tunnel", "ep", intraEp)
+			intraSeeds := []dht.Contact{{
+				ID:        dht.NodeID(vpsHubPubKey),
+				PublicKey: vpsHubPubKey,
+				Endpoint:  intraEp,
+			}}
+			dhtNode.Bootstrap(intraSeeds)
+		} else {
+			slog.Warn("hub-intra-ip provided but could not determine DHT port from seed")
+		}
+	}
+
 	// 6. Start protocols
 	pexProto.Start()
 	dhtNode.Start()
 
-	// 7. STUN to discover public address
-	stunConn, err := net.ListenUDP("udp", &net.UDPAddr{Port: *meshPort + 10})
-	if err == nil {
-		result, err := nat.DiscoverPublic(*stunAddr, stunConn)
-		if err == nil {
-			slog.Info("public address",
-				"ip", result.PublicIP,
-				"port", result.PublicPort,
-				"nat_type", result.NATType,
-			)
-		}
-		stunConn.Close()
-	}
-
 	slog.Info("wg-meshd running")
 
 	// 8. Handshake monitor: remove P2P peers when stale, fallback to VPS hub relay
-	if *relayAddr != "" {
-		// --relay flag given, but we need the VPS hub's public key from the seed.
-		// Find it from the seed list: extract the pubkey from seed entries.
-		vpsHubPubKey := ""
-		if *seedPeers != "" {
-			for _, s := range splitAndTrim(*seedPeers, ",") {
-				parts := split(s, "@")
-				if len(parts) == 2 && parts[0] != "" {
-					vpsHubPubKey = stringsTrim(parts[0])
-					break
-				}
-			}
-		}
-		if vpsHubPubKey == "" {
-			slog.Warn("relay fallback enabled but could not determine VPS hub public key from --seed")
-		} else {
-			slog.Info("handshake monitor started",
-				"vps_hub_pk", vpsHubPubKey[:16]+"...",
-				"timeout", *hsTimeout,
-				"interval", *hsInterval,
-			)
-			relayCtx, relayCancel := context.WithCancel(context.Background())
-			go runHandshakeMonitor(relayCtx, uapiClient, vpsHubPubKey, *hsTimeout, *hsInterval, *restoreIntv, state)
-			defer relayCancel()
-		}
+	if *relayAddr != "" && vpsHubPubKey != "" {
+		slog.Info("handshake monitor started",
+			"vps_hub_pk", vpsHubPubKey[:16]+"...",
+			"timeout", *hsTimeout,
+			"interval", *hsInterval,
+		)
+		relayCtx, relayCancel := context.WithCancel(context.Background())
+		go runHandshakeMonitor(relayCtx, uapiClient, vpsHubPubKey, *hsTimeout, *hsInterval, *restoreIntv, state)
+		defer relayCancel()
 	} else {
-		slog.Info("relay fallback disabled (no --relay)")
+		slog.Info("relay fallback disabled (no --relay or no seed)")
 	}
 
 	// Wait for signal
@@ -416,4 +481,24 @@ func stringsTrim(s string) string {
 		end--
 	}
 	return s[start:end]
+}
+
+// reusableListenUDP binds a UDP port with SO_REUSEPORT to share it with
+// another process (e.g., wireguard-go). On macOS, this allows multiple
+// sockets to bind the same port when SO_REUSEADDR is also set.
+// Used to STUN on the actual WireGuard port and discover the exact CGNAT mapping.
+func reusableListenUDP(port int) (*net.UDPConn, error) {
+	lc := net.ListenConfig{
+		Control: func(network, address string, c syscall.RawConn) error {
+			return c.Control(func(fd uintptr) {
+				// SO_REUSEPORT = 0x0200 on macOS (SOL_SOCKET = 0xffff)
+				syscall.SetsockoptInt(int(fd), 0xffff, 0x0200, 1)
+			})
+		},
+	}
+	pc, err := lc.ListenPacket(context.Background(), "udp", fmt.Sprintf(":%d", port))
+	if err != nil {
+		return nil, err
+	}
+	return pc.(*net.UDPConn), nil
 }
