@@ -21,9 +21,10 @@ const (
 )
 
 type Contact struct {
-	ID        string
-	PublicKey string
-	Endpoint  string
+	ID             string
+	PublicKey      string
+	Endpoint       string
+	PublicEndpoint string // STUN-discovered public address (for NAT traversal)
 }
 
 func NodeID(publicKey string) string {
@@ -63,12 +64,13 @@ type Table struct {
 }
 
 type DHT struct {
-	table     *Table
-	publicKey string
-	wgEndpoint string // this node's WireGuard endpoint (ip:port)
-	listener  net.Listener
-	log       *slog.Logger
-	stopCh    chan struct{}
+	table          *Table
+	publicKey      string
+	wgEndpoint     string // this node's WireGuard endpoint (ip:port)
+	publicEndpoint string // this node's STUN-discovered public address (ip:port), for NAT traversal
+	listener       net.Listener
+	log            *slog.Logger
+	stopCh         chan struct{}
 	onPeerDiscovered func(Contact) // callback when new peer discovered via DHT
 }
 
@@ -80,12 +82,13 @@ const (
 )
 
 type DhtMessage struct {
-	Type       uint8
-	SenderID   string
-	TargetID   string
-	Contacts   []Contact
-	PublicKey  string // sender's WireGuard public key
-	WgEndpoint string // sender's WireGuard endpoint (ip:port)
+	Type           uint8
+	SenderID       string
+	TargetID       string
+	Contacts       []Contact
+	PublicKey      string // sender's WireGuard public key
+	WgEndpoint     string // sender's WireGuard endpoint (ip:port)
+	PublicEndpoint string // sender's STUN-discovered public address (ip:port)
 }
 
 func NewDHT(publicKey string, listenPort int, wgEndpoint string) (*DHT, error) {
@@ -131,6 +134,14 @@ func (d *DHT) SetPeerCallback(fn func(Contact)) {
 	d.onPeerDiscovered = fn
 }
 
+// SetPublicEndpoint updates the DHT with the STUN-discovered public address.
+// This is called after STUN discovery completes, so subsequent findNode
+// requests include the public endpoint for cross-NAT P2P connectivity.
+func (d *DHT) SetPublicEndpoint(ep string) {
+	d.publicEndpoint = ep
+	d.log.Info("dht public endpoint set", "ep", ep)
+}
+
 func (d *DHT) acceptLoop() {
 	fmt.Printf("DHT ACCEPT LOOP ENTERED\n")
 	defer fmt.Printf("dht acceptLoop EXITED\n")
@@ -173,11 +184,13 @@ func (d *DHT) handleFindNode(conn net.Conn, msg *DhtMessage) {
 		// fallback: use the TCP connection address (DHT port, not ideal)
 		ep = conn.RemoteAddr().String()
 	}
-	d.table.insert(Contact{
-		ID:        msg.SenderID,
-		PublicKey: msg.PublicKey,
-		Endpoint:  ep,
-	})
+	contact := Contact{
+		ID:             msg.SenderID,
+		PublicKey:      msg.PublicKey,
+		Endpoint:       ep,
+		PublicEndpoint: msg.PublicEndpoint,
+	}
+	d.table.insert(contact)
 	closest := d.table.closest(msg.TargetID, kBucketSize)
 	resp := DhtMessage{Type: MsgFindNodeResp, SenderID: d.table.selfID, Contacts: closest}
 	enc := gob.NewEncoder(conn)
@@ -189,9 +202,18 @@ func (d *DHT) handleFindNodeResp(msg *DhtMessage) {
 		if c.ID != d.table.selfID {
 			d.table.insert(c)
 			if len(c.PublicKey) >= 16 {
-				d.log.Info("dht discovered peer", "id", c.ID[:8], "pk", c.PublicKey[:16], "ep", c.Endpoint)
+				d.log.Info("dht discovered peer",
+					"id", c.ID[:8],
+					"pk", c.PublicKey[:16],
+					"ep", c.Endpoint,
+					"public_ep", c.PublicEndpoint,
+				)
 			} else {
-				d.log.Debug("dht discovered peer (incomplete)", "id", c.ID[:8], "ep", c.Endpoint)
+				d.log.Debug("dht discovered peer (incomplete)",
+					"id", c.ID[:8],
+					"ep", c.Endpoint,
+					"public_ep", c.PublicEndpoint,
+				)
 			}
 			if d.onPeerDiscovered != nil && c.PublicKey != "" {
 				d.onPeerDiscovered(c)
@@ -227,11 +249,12 @@ func (d *DHT) findNode(targetID string, contact Contact) {
 	defer conn.Close()
 
 	msg := DhtMessage{
-		Type:       MsgFindNode,
-		SenderID:   d.table.selfID,
-		TargetID:   targetID,
-		PublicKey:  d.publicKey,
-		WgEndpoint: d.wgEndpoint,
+		Type:           MsgFindNode,
+		SenderID:       d.table.selfID,
+		TargetID:       targetID,
+		PublicKey:      d.publicKey,
+		WgEndpoint:     d.wgEndpoint,
+		PublicEndpoint: d.publicEndpoint,
 	}
 	enc := gob.NewEncoder(conn)
 	if err := enc.Encode(msg); err != nil {

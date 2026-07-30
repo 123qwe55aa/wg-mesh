@@ -104,8 +104,13 @@ func main() {
 
 	// Resolve WG endpoint for DHT discovery
 	localWgEp := *wgEndpoint
+	if localWgEp == "" {
+		localWgEp = *vpsAddr
+	}
 
-	// If --wg-endpoint not explicitly set, auto-discover public endpoint via STUN
+	// Auto-discover public endpoint via STUN (only when --wg-endpoint not explicitly set)
+	var publicWgEp string
+	var stunNATType string
 	if *wgEndpoint == "" {
 		// Get the local WireGuard listen port from wg show
 		wgDump, err := uapiClient.ShowDump()
@@ -140,35 +145,26 @@ func main() {
 				stunResult, err2 = nat.DiscoverPublic(*stunAddr, stunConn2)
 				stunConn2.Close()
 				if err2 == nil && stunResult != nil && stunResult.PublicIP != nil {
-					// We have the correct public IP; use WG internal port as endpoint.
-					// NAT3's endpoint-independent mapping means the CGNAT port differs,
-					// but the IP is correct — hub relay fallback handles the port mismatch.
-					localWgEp = net.JoinHostPort(stunResult.PublicIP.String(), strconv.Itoa(wgPort))
+					publicWgEp = net.JoinHostPort(stunResult.PublicIP.String(), strconv.Itoa(wgPort))
+					stunNATType = stunResult.NATType
 					slog.Info("auto-discovered public IP from STUN",
-						"endpoint", localWgEp,
-						"nat_type", stunResult.NATType,
+						"public_ep", publicWgEp,
+						"lan_ep", localWgEp,
+						"nat_type", stunNATType,
 						"wg_port", wgPort,
 					)
 				}
 			}
 		} else {
 			// REUSEPORT succeeded — we have the exact CGNAT mapping (IP + port)
-			localWgEp = net.JoinHostPort(stunResult.PublicIP.String(), strconv.Itoa(stunResult.PublicPort))
+			publicWgEp = net.JoinHostPort(stunResult.PublicIP.String(), strconv.Itoa(stunResult.PublicPort))
+			stunNATType = stunResult.NATType
 			slog.Info("auto-discovered public WG endpoint from STUN",
-				"endpoint", localWgEp,
-				"nat_type", stunResult.NATType,
+				"public_ep", publicWgEp,
+				"lan_ep", localWgEp,
+				"nat_type", stunNATType,
 			)
 		}
-
-		if localWgEp == "" {
-			slog.Warn("STUN discovery failed, falling back to --vps as DHT endpoint",
-				"vps", *vpsAddr,
-			)
-			localWgEp = *vpsAddr
-		}
-	}
-	if localWgEp == "" {
-		localWgEp = *vpsAddr
 	}
 
 	// 4. Initialize DHT for bootstrap discovery (different port from PEX)
@@ -178,23 +174,41 @@ func main() {
 		os.Exit(1)
 	}
 
+	// Register public endpoint for NAT traversal (only when STUN-discovered and differs from LAN)
+	if publicWgEp != "" && publicWgEp != localWgEp {
+		dhtNode.SetPublicEndpoint(publicWgEp)
+		slog.Info("dht registered dual endpoints",
+			"lan", localWgEp,
+			"public", publicWgEp,
+			"nat_type", stunNATType,
+		)
+	}
+
 	// DHT 发现新 peer 时自动加到 WireGuard
 	dhtNode.SetPeerCallback(func(c dht.Contact) {
 		if c.PublicKey == "" {
 			return
 		}
-		// 用 DHT 的 endpoint 配置 peer
-		// AllowedIPs 留空：WireGuard 会保留已有的 VPS hub /24 路由
-		// 用户可手动添加 /32 实现 P2P 直连
+		// 优先用 PublicEndpoint（跨网可达），fallback 到 LAN endpoint
+		// WG roaming 会自动切换到更优路径
+		wgEp := c.Endpoint
+		if c.PublicEndpoint != "" {
+			wgEp = c.PublicEndpoint
+		}
 		if err := uapiClient.SetPeer(uapi.PeerConfig{
 			PublicKey:  c.PublicKey,
-			Endpoint:   c.Endpoint,
+			Endpoint:   wgEp,
 			AllowedIPs: "",
 			KeepAlive:  25,
 		}); err != nil {
 			slog.Warn("failed to add dht peer to wireguard", "pk", c.PublicKey[:16], "error", err)
 		} else {
-			slog.Info("dht peer added to wireguard", "pk", c.PublicKey[:16], "ep", c.Endpoint)
+			slog.Info("dht peer added to wireguard",
+				"pk", c.PublicKey[:16],
+				"ep", wgEp,
+				"lan_ep", c.Endpoint,
+				"public_ep", c.PublicEndpoint,
+			)
 		}
 	})
 
