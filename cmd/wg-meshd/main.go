@@ -24,6 +24,7 @@ import (
 	"os/signal"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -192,6 +193,13 @@ func main() {
 			"nat_type", stunNATType,
 		)
 	}
+
+	// Install hub-authoritative endpoint override: periodically read the
+	// real WG endpoints observed on this node's WireGuard interface and use
+	// them to correct STUN-reported public endpoints in findNode responses.
+	// This is the key fix for CGNAT cases where STUN reports the internal
+	// port (e.g. 58715) but the actual external mapping differs (e.g. 46583).
+	installEndpointOverride(uapiClient, dhtNode, logger)
 
 	// DHT 发现新 peer 时自动加到 WireGuard
 	dhtNode.SetPeerCallback(func(c dht.Contact) {
@@ -481,6 +489,50 @@ func runHandshakeMonitor(
 
 func isExpired(t time.Time, d time.Duration) bool {
 	return time.Since(t) >= d
+}
+
+// installEndpointOverride periodically reads the real WG endpoints observed
+// on this node's WireGuard interface and installs a DHT endpoint override.
+// On the hub, every peer's endpoint here IS the authoritative CGNAT mapping
+// (the hub sees the actual source ip:port of WG handshakes). This fixes the
+// STUN blind spot: STUN often reports the internal port (e.g. 58715) while
+// the real external mapping differs (e.g. 163.125.134.99:46583).
+func installEndpointOverride(client *uapi.Client, dhtNode *dht.DHT, logger *slog.Logger) {
+	observed := make(map[string]string)
+	var mu sync.Mutex
+
+	refresh := func() {
+		peers, err := client.ListPeers()
+		if err != nil {
+			logger.Debug("endpoint override refresh failed", "error", err)
+			return
+		}
+		updated := make(map[string]string)
+		for _, p := range peers {
+			if p.Endpoint != "" && p.Endpoint != "(none)" {
+				updated[p.PublicKey] = p.Endpoint
+			}
+		}
+		mu.Lock()
+		observed = updated
+		mu.Unlock()
+		logger.Debug("endpoint override refreshed", "count", len(updated))
+	}
+
+	refresh()
+	go func() {
+		ticker := time.NewTicker(30 * time.Second)
+		defer ticker.Stop()
+		for range ticker.C {
+			refresh()
+		}
+	}()
+
+	dhtNode.SetEndpointOverride(func(pubkey string) string {
+		mu.Lock()
+		defer mu.Unlock()
+		return observed[pubkey]
+	})
 }
 
 // splitHost extracts host from "host:port" or returns the string as-is.

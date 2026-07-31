@@ -73,6 +73,12 @@ type DHT struct {
 	log            *slog.Logger
 	stopCh         chan struct{}
 	onPeerDiscovered func(Contact) // callback when new peer discovered via DHT
+
+	// endpointOverride, when set (typically on the hub), returns the
+	// authoritative public endpoint for a peer as observed by this node's
+	// WireGuard interface. More reliable than STUN-reported endpoints:
+	// the hub sees the real CGNAT mapping (ip:port).
+	endpointOverride func(pubkey string) string
 }
 
 const (
@@ -145,6 +151,20 @@ func (d *DHT) SetPublicEndpoint(ep string) {
 	d.log.Info("dht public endpoint set", "ep", ep)
 }
 
+// SetEndpointOverride installs a callback that returns the authoritative
+// public endpoint for a peer as observed by this node's WireGuard interface.
+// Used on the hub: the hub sees the real CGNAT mapping for every peer, which
+// is more accurate than STUN-reported endpoints (STUN often reports the
+// internal port, which differs from the CGNAT-mapped external port).
+// When the callback returns a non-empty string, it replaces the peer's
+// STUN-reported PublicEndpoint in findNode responses.
+func (d *DHT) SetEndpointOverride(fn func(pubkey string) string) {
+	d.endpointOverride = fn
+	if fn != nil {
+		d.log.Info("dht endpoint override installed (hub authoritative endpoints)")
+	}
+}
+
 func (d *DHT) acceptLoop() {
 	fmt.Printf("DHT ACCEPT LOOP ENTERED\n")
 	defer fmt.Printf("dht acceptLoop EXITED\n")
@@ -206,6 +226,26 @@ func (d *DHT) handleFindNode(conn net.Conn, msg *DhtMessage) {
 		d.onPeerDiscovered(contact)
 	}
 	closest := d.table.closest(msg.TargetID, kBucketSize)
+	// When this node is the hub (or otherwise observes peers' real WG
+	// endpoints), replace STUN-reported public endpoints with the
+	// authoritative endpoints seen on the WireGuard interface. This fixes
+	// CGNAT cases where STUN reports the internal port instead of the
+	// actual external mapping.
+	if d.endpointOverride != nil {
+		for i := range closest {
+			if closest[i].PublicKey == "" {
+				continue
+			}
+			if ov := d.endpointOverride(closest[i].PublicKey); ov != "" && ov != closest[i].PublicEndpoint {
+				d.log.Debug("dht overriding peer public endpoint",
+					"pk", closest[i].PublicKey[:16],
+					"old", closest[i].PublicEndpoint,
+					"new", ov,
+				)
+				closest[i].PublicEndpoint = ov
+			}
+		}
+	}
 	resp := DhtMessage{Type: MsgFindNodeResp, SenderID: d.table.selfID, Contacts: closest}
 	enc := gob.NewEncoder(conn)
 	enc.Encode(resp)
