@@ -46,3 +46,26 @@
 - Caveat: probing ports are ephemeral — prediction is a window, not a
   guarantee. See `pkg/nat/predict_test.go` for the edge cases handled
   (unstable delta → abandon, zero delta = cone → abandon, wrap-around → 0).
+
+## Field observation: NAT4 is not always sequential (2026-07, outdoor WiFi)
+
+Probed with one UDP socket against multiple STUN targets:
+
+```
+local socket 61943:
+  → 74.125.250.129 (stun.l.google.com:19302)  → external 3245
+  → 162.159.207.0  (stun.cloudflare.com:3478) → external 17347
+  stable across 3 rounds → Address-Dependent Mapping (NAT4 family)
+  delta between targets = +14102 → NOT sequential
+```
+
+Implications:
+- Some NAT4 implementations assign ports per-destination with NO
+  predictable sequence (randomized/hashed allocation). Sequential-step
+  prediction (PortPredictor) correctly reports "not predictable" via
+  Analyze() and refuses to guess — the right failure mode.
+- For this class of NAT4, multi-port blind probing (Tailscale-style) or
+  relay fallback is the only path. Keep `--port-predict` for NAT4
+  implementations that DO allocate sequentially (e.g. some carrier CGNATs).
+- Prediction value is per-network: same code, different results depending
+  on which NAT4 implementation the user is behind.
