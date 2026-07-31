@@ -37,18 +37,20 @@ import (
 
 func main() {
 	var (
-		publicKey   = flag.String("public-key", "", "WireGuard public key of this node")
-		meshPort    = flag.Int("mesh-port", 51821, "Mesh control (PEX/DHT) TCP port")
-		stunAddr    = flag.String("stun", "stun.miwifi.com:3478", "STUN server address")
-		seedPeers   = flag.String("seed", "", "Comma-separated seed peers (publickey@ip:port)")
-		vpsAddr     = flag.String("vps", "", "VPS public address for WireGuard endpoint (ip:port), e.g. 175.178.118.76:51820")
+		publicKey     = flag.String("public-key", "", "WireGuard public key of this node")
+		meshPort      = flag.Int("mesh-port", 51821, "Mesh control (PEX/DHT) TCP port")
+		stunAddr      = flag.String("stun", "stun.miwifi.com:3478", "STUN server address")
+		stunAddrs     = flag.String("stun-addrs", "stun.miwifi.com:3478,stun.l.google.com:19302,stun.cloudflare.com:3478", "Comma-separated STUN servers for symmetric NAT port-allocation probing")
+		enablePred    = flag.Bool("port-predict", false, "Enable symmetric NAT port prediction for hole punching")
+		seedPeers     = flag.String("seed", "", "Comma-separated seed peers (publickey@ip:port)")
+		vpsAddr       = flag.String("vps", "", "VPS public address for WireGuard endpoint (ip:port), e.g. 175.178.118.76:51820")
 		interfaceName = flag.String("interface", "wg0", "WireGuard interface name")
-		wgEndpoint  = flag.String("wg-endpoint", "", "This node's WireGuard endpoint (ip:port) for DHT discovery. If empty, falls back to --vps value")
-		relayAddr   = flag.String("relay", "", "VPS relay endpoint for fallback when P2P fails (ip:port), e.g. 175.178.118.76:51820")
-		hubIntraIP = flag.String("hub-intra-ip", "", "VPS hub internal mesh IP for DHT fallback when public IP is blocked (e.g. 10.200.200.1)")
-		hsTimeout   = flag.Duration("handshake-timeout", 2*time.Minute, "Handshake age threshold before removing P2P peer (0 = auto)")
-		hsInterval  = flag.Duration("handshake-interval", 15*time.Second, "How often to check peer handshake status")
-		restoreIntv = flag.Duration("restore-interval", 5*time.Minute, "How often to try restoring P2P peer from relay")
+		wgEndpoint    = flag.String("wg-endpoint", "", "This node's WireGuard endpoint (ip:port) for DHT discovery. If empty, falls back to --vps value")
+		relayAddr     = flag.String("relay", "", "VPS relay endpoint for fallback when P2P fails (ip:port), e.g. 175.178.118.76:51820")
+		hubIntraIP    = flag.String("hub-intra-ip", "", "VPS hub internal mesh IP for DHT fallback when public IP is blocked (e.g. 10.200.200.1)")
+		hsTimeout     = flag.Duration("handshake-timeout", 2*time.Minute, "Handshake age threshold before removing P2P peer (0 = auto)")
+		hsInterval    = flag.Duration("handshake-interval", 15*time.Second, "How often to check peer handshake status")
+		restoreIntv   = flag.Duration("restore-interval", 5*time.Minute, "How often to try restoring P2P peer from relay")
 	)
 	flag.Parse()
 
@@ -112,6 +114,7 @@ func main() {
 	// Auto-discover public endpoint via STUN (only when --wg-endpoint not explicitly set)
 	var publicWgEp string
 	var stunNATType string
+	var wgPortForPredict int // WG listen port, reused by port predictor
 	if *wgEndpoint == "" {
 		// Get the local WireGuard listen port from wg show
 		wgDump, err := uapiClient.ShowDump()
@@ -128,6 +131,7 @@ func main() {
 		if wgPort == 0 {
 			wgPort = *meshPort // fallback: use mesh port as WG port hint
 		}
+		wgPortForPredict = wgPort
 
 		// Try STUN on the actual WG port via SO_REUSEPORT first.
 		// This gives the exact CGNAT mapping (port and IP) when supported.
@@ -169,15 +173,15 @@ func main() {
 				"nat_type", stunNATType,
 			)
 		}
-	// If STUN failed entirely and --wg-endpoint was not explicitly set,
-	// clear localWgEp so DHT sends no WgEndpoint. Hub will use the TCP
-	// connection's source address as fallback in handleFindNode.
-	if *wgEndpoint == "" && publicWgEp == "" {
-		localWgEp = ""
+		// If STUN failed entirely and --wg-endpoint was not explicitly set,
+		// clear localWgEp so DHT sends no WgEndpoint. Hub will use the TCP
+		// connection's source address as fallback in handleFindNode.
+		if *wgEndpoint == "" && publicWgEp == "" {
+			localWgEp = ""
+		}
 	}
-}
 
-// 4. Initialize DHT for bootstrap discovery (different port from PEX)
+	// 4. Initialize DHT for bootstrap discovery (different port from PEX)
 	dhtNode, err := dht.NewDHT(*publicKey, *meshPort+1, localWgEp)
 	if err != nil {
 		slog.Error("failed to create dht", "error", err)
@@ -200,6 +204,22 @@ func main() {
 	// This is the key fix for CGNAT cases where STUN reports the internal
 	// port (e.g. 58715) but the actual external mapping differs (e.g. 46583).
 	installEndpointOverride(uapiClient, dhtNode, logger)
+
+	// Symmetric NAT port prediction: when enabled, probe the NAT's port
+	// allocation delta on the real WG port and register the PREDICTED next
+	// port as our public endpoint. Peers can then reply to that port for
+	// hole punching before the mapping exists.
+	if *enablePred && *wgEndpoint == "" {
+		// Resolve our public IP from the earlier STUN result if available.
+		pubIP := ""
+		if publicWgEp != "" {
+			if h, _, err := net.SplitHostPort(publicWgEp); err == nil {
+				pubIP = h
+			}
+		}
+		go runPortPredictor(*stunAddrs, uapiClient, dhtNode, wgPortForPredict, pubIP, logger)
+		slog.Info("port prediction enabled", "stun_addrs", *stunAddrs, "public_ip", pubIP)
+	}
 
 	// DHT 发现新 peer 时自动加到 WireGuard
 	dhtNode.SetPeerCallback(func(c dht.Contact) {
@@ -256,10 +276,10 @@ func main() {
 						wgEp = *vpsAddr
 					}
 					if err := uapiClient.SetPeer(uapi.PeerConfig{
-						PublicKey: pk,
-						Endpoint:  wgEp,
+						PublicKey:  pk,
+						Endpoint:   wgEp,
 						AllowedIPs: "10.200.200.0/24",
-						KeepAlive: 25,
+						KeepAlive:  25,
 					}); err != nil {
 						slog.Warn("failed to add seed to wireguard", "error", err)
 					} else {
@@ -489,6 +509,87 @@ func runHandshakeMonitor(
 
 func isExpired(t time.Time, d time.Duration) bool {
 	return time.Since(t) >= d
+}
+
+// runPortPredictor continuously probes the NAT's port-allocation delta on the
+// real WG port and registers the PREDICTED next external port as the DHT
+// public endpoint. On a symmetric NAT (NAT4) the allocation is often
+// sequential, so peers can reply to the predicted port to hole-punch before
+// the mapping exists.
+//
+// The prediction window is short: other traffic advances the NAT counter, so
+// we re-probe on an interval (default 60s) and re-register.
+func runPortPredictor(stunAddrs string, client *uapi.Client, dhtNode *dht.DHT, wgPort int, pubIP string, logger *slog.Logger) {
+	if wgPort == 0 {
+		logger.Warn("port predictor: no WG port available, disabled")
+		return
+	}
+
+	probe := func() {
+		// Bind on the real WG port (SO_REUSEPORT) so the probe socket shares
+		// the same NAT mapping family as the actual WireGuard socket.
+		conn, err := reusableListenUDP(wgPort)
+		if err != nil {
+			logger.Warn("port predictor: reusable listen failed", "port", wgPort, "error", err)
+			return
+		}
+		defer conn.Close()
+
+		p := nat.NewPortPredictor(stunAddrs, conn)
+		// Probe 4 distinct destinations to sample the allocation sequence.
+		for i := 0; i < 4; i++ {
+			if err := p.Probe(); err != nil {
+				logger.Debug("port predictor probe failed", "error", err)
+				return
+			}
+		}
+		if !p.Analyze() {
+			logger.Info("port predictor: NAT port allocation not predictable (EIM/cone or random)",
+				"samples", p.LastSample())
+			return
+		}
+
+		predicted := p.PredictForTarget(1)
+		if predicted == 0 {
+			logger.Warn("port predictor: predicted port out of range")
+			return
+		}
+		// Resolve public IP: prefer STUN result, else derive from wg endpoints.
+		ip := pubIP
+		if ip == "" {
+			peers, err := client.ListPeers()
+			if err == nil {
+				for _, peer := range peers {
+					if peer.Endpoint != "" && peer.Endpoint != "(none)" {
+						if h, _, err := net.SplitHostPort(peer.Endpoint); err == nil && net.ParseIP(h) != nil {
+							ip = h
+							break
+						}
+					}
+				}
+			}
+		}
+		if ip == "" {
+			logger.Warn("port predictor: could not determine public IP")
+			return
+		}
+
+		predEp := net.JoinHostPort(ip, strconv.Itoa(predicted))
+		dhtNode.SetPublicEndpoint(predEp)
+		logger.Info("port predictor: registered predicted endpoint",
+			"public_ep", predEp,
+			"step", p.Step(),
+			"last_sample", p.LastSample(),
+		)
+	}
+
+	// Initial probe immediately, then refresh periodically.
+	probe()
+	ticker := time.NewTicker(60 * time.Second)
+	defer ticker.Stop()
+	for range ticker.C {
+		probe()
+	}
 }
 
 // installEndpointOverride periodically reads the real WG endpoints observed

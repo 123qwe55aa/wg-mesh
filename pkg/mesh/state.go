@@ -10,13 +10,13 @@ import (
 
 // PeerState tracks what we know about a remote peer.
 type PeerState struct {
-	PublicKey    string
-	VirtualIP    string // optional: internal mesh IP
-	Endpoints    []string
-	LastSeen     time.Time
-	Latency      time.Duration
-	IsConnected  bool
-	SoftwareVer  string
+	PublicKey   string
+	VirtualIP   string // optional: internal mesh IP
+	Endpoints   []string
+	LastSeen    time.Time
+	Latency     time.Duration
+	IsConnected bool
+	SoftwareVer string
 }
 
 // Event describes a change in mesh state that listeners should react to.
@@ -36,10 +36,10 @@ const (
 
 // State is the central mesh peer registry.
 type State struct {
-	mu     sync.RWMutex
-	peers  map[string]*PeerState
-	self   *PeerState
-	log    *slog.Logger
+	mu    sync.RWMutex
+	peers map[string]*PeerState
+	self  *PeerState
+	log   *slog.Logger
 }
 
 func NewState(selfKey string) *State {

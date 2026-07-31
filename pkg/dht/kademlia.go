@@ -64,14 +64,14 @@ type Table struct {
 }
 
 type DHT struct {
-	table          *Table
-	publicKey      string
-	wgEndpoint     string // this node's WireGuard endpoint (ip:port)
-	publicEndpoint string // this node's STUN-discovered public address (ip:port), for NAT traversal
-	seedContact    Contact // first seed contact, used for peer state reporting
-	listener       net.Listener
-	log            *slog.Logger
-	stopCh         chan struct{}
+	table            *Table
+	publicKey        string
+	wgEndpoint       string  // this node's WireGuard endpoint (ip:port)
+	publicEndpoint   string  // this node's STUN-discovered public address (ip:port), for NAT traversal
+	seedContact      Contact // first seed contact, used for peer state reporting
+	listener         net.Listener
+	log              *slog.Logger
+	stopCh           chan struct{}
 	onPeerDiscovered func(Contact) // callback when new peer discovered via DHT
 
 	// endpointOverride, when set (typically on the hub), returns the
