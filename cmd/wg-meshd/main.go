@@ -423,24 +423,31 @@ func runHandshakeMonitor(
 			}
 
 			if age > int64(timeout.Seconds()) {
-				slog.Warn("P2P handshake stale, removing peer (traffic will use VPS hub relay)",
+				slog.Warn("P2P handshake stale, clearing /32 route (traffic will use VPS hub relay)",
 					"pk", p.PublicKey[:16],
 					"age", age,
 					"old_endpoint", p.Endpoint,
-					"allowed_ips", p.AllowedIPs,
 				)
-				// Save before removing
+				// Clear /32 so traffic falls back to hub's /24 relay.
+				// Do NOT remove the peer — DHT just re-adds it, causing
+				// a delete/re-add cycle that briefly breaks the relay.
+				if strings.TrimSpace(p.AllowedIPs) != "" {
+					if err := client.SetPeer(uapi.PeerConfig{
+						PublicKey:  p.PublicKey,
+						Endpoint:   p.Endpoint,
+						AllowedIPs: "",
+						KeepAlive:  p.PersistentKeepalive,
+					}); err != nil {
+						slog.Warn("failed to clear P2P /32 route", "error", err)
+					}
+				}
+				// Save peer for restore check so we don't re-process
 				savedPeers[p.PublicKey] = &savedPeer{
 					PublicKey:  p.PublicKey,
 					Endpoint:   p.Endpoint,
 					AllowedIPs: p.AllowedIPs,
 					KeepAlive:  p.PersistentKeepalive,
 					removedAt:  time.Now(),
-				}
-				if err := client.RemovePeer(p.PublicKey); err != nil {
-					slog.Warn("failed to remove P2P peer", "error", err)
-					delete(savedPeers, p.PublicKey)
-					continue
 				}
 				state.UpsertPeer(p.PublicKey, func(ps *mesh.PeerState) {
 					ps.IsConnected = false
