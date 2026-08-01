@@ -267,6 +267,19 @@ func (d *DHT) handleConn(conn net.Conn) {
 func (d *DHT) SendPunchPlan(contact Contact, targetPublicKey, targetEndpoint, punchID string, start time.Time, window time.Duration, ports []string) error {
 	d.controlMu.Lock()
 	conn := d.controlConns[contact.PublicKey]
+	// Debug: log controlConn lookup result
+	if conn == nil {
+		keys := make([]string, 0, len(d.controlConns))
+		for k := range d.controlConns {
+			keys = append(keys, k[:16]+"...")
+		}
+		d.log.Warn("SendPunchPlan: no controlConn for peer, falling back to reverse dial",
+			"target_pk", contact.PublicKey[:32],
+			"control_conn_keys", keys,
+			"control_endpoint", contact.ControlEndpoint,
+			"endpoint", contact.Endpoint,
+		)
+	}
 	d.controlMu.Unlock()
 	if conn != nil {
 		msg := DhtMessage{Type: MsgPunchPlan, SenderID: d.table.selfID, PublicKey: d.publicKey, TargetPublicKey: targetPublicKey, WgEndpoint: targetEndpoint, PunchID: punchID, PunchStartUnix: start.UnixMilli(), PunchWindowMs: int(window / time.Millisecond), PunchPorts: append([]string(nil), ports...)}
