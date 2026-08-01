@@ -455,7 +455,13 @@ func (d *DHT) findNode(targetID string, contact Contact) {
 		d.log.Warn("dht find_node connect failed", "ep", contact.Endpoint, "error", err)
 		return
 	}
-	defer conn.Close()
+	// Always send MsgControlHello first — without it the hub/seed will not
+	// store our control connection, and SendPunchPlan will fall back to a
+	// reverse TCP dial that CGNAT peers cannot accept.
+	if err := gob.NewEncoder(conn).Encode(DhtMessage{Type: MsgControlHello, SenderID: d.table.selfID, PublicKey: d.publicKey}); err != nil {
+		conn.Close()
+		return
+	}
 
 	msg := DhtMessage{
 		Type:           MsgFindNode,
@@ -465,9 +471,6 @@ func (d *DHT) findNode(targetID string, contact Contact) {
 		WgEndpoint:     d.wgEndpoint,
 		PublicEndpoint: d.publicEndpoint,
 	}
-	// Advertise the DHT TCP address separately from the WireGuard UDP endpoint.
-	// A TCP connection's RemoteAddr is an ephemeral client port and cannot be
-	// used by the hub to send a later punch plan.
 	if _, host, err := net.SplitHostPort(d.publicEndpoint); err == nil && host != "" {
 		if tcpAddr, ok := d.listener.Addr().(*net.TCPAddr); ok {
 			msg.ControlEndpoint = net.JoinHostPort(host, strconv.Itoa(tcpAddr.Port))
@@ -475,17 +478,29 @@ func (d *DHT) findNode(targetID string, contact Contact) {
 	}
 	enc := gob.NewEncoder(conn)
 	if err := enc.Encode(msg); err != nil {
+		conn.Close()
 		return
 	}
 
-	var resp DhtMessage
-	dec := gob.NewDecoder(conn)
-	if err := dec.Decode(&resp); err != nil {
-		return
-	}
-	if resp.Type == MsgFindNodeResp {
-		d.handleFindNodeResp(&resp)
-	}
+	// Keep the connection alive in a reader goroutine so the hub can
+	// later deliver PunchPlan messages through it.
+	go func() {
+		defer conn.Close()
+		dec := gob.NewDecoder(conn)
+		for {
+			var resp DhtMessage
+			if err := dec.Decode(&resp); err != nil {
+				return
+			}
+			if resp.Type == MsgFindNodeResp {
+				d.handleFindNodeResp(&resp)
+			} else if resp.Type == MsgPunchPlan {
+				if d.onPunchPlan != nil {
+					d.onPunchPlan(resp)
+				}
+			}
+		}
+	}()
 }
 
 func (d *DHT) KnownPeers() []Contact {
