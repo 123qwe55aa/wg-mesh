@@ -4,12 +4,17 @@
 package uapi
 
 import (
+	"bufio"
+	"encoding/base64"
+	"encoding/hex"
 	"fmt"
+	"net"
 	"os"
 	"os/exec"
 	"runtime"
 	"strconv"
 	"strings"
+	"time"
 )
 
 type PeerConfig struct {
@@ -154,4 +159,44 @@ func (c *Client) SetEndpoint(publicKey, endpoint string) error {
 		return fmt.Errorf("wg set endpoint: %s: %w", strings.TrimSpace(string(out)), err)
 	}
 	return nil
+}
+
+// SetEndpointFast updates a peer through WireGuard's UAPI socket when it is
+// available, avoiding one process spawn per candidate during a port scan.
+// It falls back to the normal wg CLI on platforms without an accessible UAPI.
+func (c *Client) SetEndpointFast(publicKey, endpoint string) error {
+	paths := []string{
+		"/var/run/wireguard/" + c.iface + ".sock",
+		"/run/wireguard/" + c.iface + ".sock",
+	}
+	for _, path := range paths {
+		conn, err := net.DialTimeout("unix", path, 500*time.Millisecond)
+		if err != nil {
+			continue
+		}
+		_ = conn.SetWriteDeadline(time.Now().Add(time.Second))
+		// WireGuard UAPI expects the peer public key as 64 hex characters;
+		// wg-mesh stores keys in base64 for the `wg` CLI.
+		keyBytes, decodeErr := base64.StdEncoding.DecodeString(publicKey)
+		if decodeErr != nil || len(keyBytes) != 32 {
+			_ = conn.Close()
+			return c.SetEndpoint(publicKey, endpoint)
+		}
+		uapiKey := hex.EncodeToString(keyBytes)
+		_, err = fmt.Fprintf(conn, "set=1\npublic_key=%s\nendpoint=%s\n\n", uapiKey, endpoint)
+		if err == nil {
+			_ = conn.SetReadDeadline(time.Now().Add(time.Second))
+			line, readErr := bufio.NewReader(conn).ReadString('\n')
+			if readErr == nil && strings.TrimSpace(line) == "errno=0" {
+				_ = conn.Close()
+				return nil
+			}
+			err = fmt.Errorf("uapi response: %s", strings.TrimSpace(line))
+		}
+		_ = conn.Close()
+		if err != nil {
+			break
+		}
+	}
+	return c.SetEndpoint(publicKey, endpoint)
 }

@@ -10,6 +10,7 @@ import (
 	"math/bits"
 	"net"
 	"sort"
+	"strconv"
 	"sync"
 	"time"
 )
@@ -21,10 +22,11 @@ const (
 )
 
 type Contact struct {
-	ID             string
-	PublicKey      string
-	Endpoint       string
-	PublicEndpoint string // STUN-discovered public address (for NAT traversal)
+	ID              string
+	PublicKey       string
+	Endpoint        string
+	PublicEndpoint  string // STUN-discovered public address (for NAT traversal)
+	ControlEndpoint string // DHT TCP address; distinct from the WG UDP endpoint
 }
 
 func NodeID(publicKey string) string {
@@ -73,12 +75,13 @@ type DHT struct {
 	log              *slog.Logger
 	stopCh           chan struct{}
 	onPeerDiscovered func(Contact) // callback when new peer discovered via DHT
-
-	// endpointOverride, when set (typically on the hub), returns the
-	// authoritative public endpoint for a peer as observed by this node's
-	// WireGuard interface. More reliable than STUN-reported endpoints:
-	// the hub sees the real CGNAT mapping (ip:port).
-	endpointOverride func(pubkey string) string
+	onPunchPlan      func(DhtMessage)
+	controlMu        sync.Mutex
+	controlConns     map[string]net.Conn
+	// observedEndpoint returns the endpoint currently observed by the local
+	// WireGuard device. The hub uses this to replace a peer's self-reported
+	// endpoint (which may be a STUN guess).
+	observedEndpoint func(publicKey string) string
 }
 
 const (
@@ -87,17 +90,25 @@ const (
 	MsgPing
 	MsgPong
 	MsgReportState
+	MsgPunchPlan
+	MsgControlHello
 )
 
 type DhtMessage struct {
-	Type           uint8
-	SenderID       string
-	TargetID       string
-	Contacts       []Contact
-	PublicKey      string // sender's WireGuard public key
-	WgEndpoint     string // sender's WireGuard endpoint (ip:port)
-	PublicEndpoint string // sender's STUN-discovered public address (ip:port)
-	State          string // peer connection state: "p2p", "relay", "disconnected"
+	Type            uint8
+	SenderID        string
+	TargetID        string
+	Contacts        []Contact
+	PublicKey       string // sender's WireGuard public key
+	WgEndpoint      string // sender's WireGuard endpoint (ip:port)
+	PublicEndpoint  string // sender's STUN-discovered public address (ip:port)
+	State           string // peer connection state: "p2p", "relay", "disconnected"
+	ControlEndpoint string // sender's reachable DHT TCP address
+	PunchID         string
+	TargetPublicKey string
+	PunchStartUnix  int64
+	PunchWindowMs   int
+	PunchPorts      []string
 }
 
 func NewDHT(publicKey string, listenPort int, wgEndpoint string) (*DHT, error) {
@@ -115,12 +126,13 @@ func NewDHT(publicKey string, listenPort int, wgEndpoint string) (*DHT, error) {
 		table.buckets[i] = &KBucket{}
 	}
 	return &DHT{
-		table:      table,
-		publicKey:  publicKey,
-		wgEndpoint: wgEndpoint,
-		listener:   l,
-		log:        slog.With("module", "dht"),
-		stopCh:     make(chan struct{}),
+		table:        table,
+		publicKey:    publicKey,
+		wgEndpoint:   wgEndpoint,
+		listener:     l,
+		log:          slog.With("module", "dht"),
+		stopCh:       make(chan struct{}),
+		controlConns: make(map[string]net.Conn),
 	}, nil
 }
 
@@ -143,26 +155,57 @@ func (d *DHT) SetPeerCallback(fn func(Contact)) {
 	d.onPeerDiscovered = fn
 }
 
+// SetPunchPlanCallback registers the synchronized punch-plan handler. The
+// callback must only prepare the local WG endpoint; the actual attempt should
+// begin at PunchStartUnix and remain relay-safe until a real handshake arrives.
+func (d *DHT) SetPunchPlanCallback(fn func(DhtMessage)) {
+	d.onPunchPlan = fn
+}
+
+// OpenControl keeps a node-initiated TCP control channel open to the peer.
+// The peer can then send PunchPlan messages back without dialing through NAT.
+func (d *DHT) OpenControl(contact Contact) error {
+	addr := contact.ControlEndpoint
+	if addr == "" {
+		addr = contact.Endpoint
+	}
+	if addr == "" {
+		return fmt.Errorf("control: empty endpoint")
+	}
+	conn, err := net.DialTimeout("tcp", addr, 5*time.Second)
+	if err != nil {
+		return err
+	}
+	if err := gob.NewEncoder(conn).Encode(DhtMessage{Type: MsgControlHello, SenderID: d.table.selfID, PublicKey: d.publicKey}); err != nil {
+		conn.Close()
+		return err
+	}
+	go func() {
+		dec := gob.NewDecoder(conn)
+		for {
+			var msg DhtMessage
+			if err := dec.Decode(&msg); err != nil {
+				conn.Close()
+				return
+			}
+			if msg.Type == MsgPunchPlan && d.onPunchPlan != nil {
+				d.onPunchPlan(msg)
+			}
+		}
+	}()
+	return nil
+}
+
+func (d *DHT) SetObservedEndpoint(fn func(publicKey string) string) {
+	d.observedEndpoint = fn
+}
+
 // SetPublicEndpoint updates the DHT with the STUN-discovered public address.
 // This is called after STUN discovery completes, so subsequent findNode
 // requests include the public endpoint for cross-NAT P2P connectivity.
 func (d *DHT) SetPublicEndpoint(ep string) {
 	d.publicEndpoint = ep
 	d.log.Info("dht public endpoint set", "ep", ep)
-}
-
-// SetEndpointOverride installs a callback that returns the authoritative
-// public endpoint for a peer as observed by this node's WireGuard interface.
-// Used on the hub: the hub sees the real CGNAT mapping for every peer, which
-// is more accurate than STUN-reported endpoints (STUN often reports the
-// internal port, which differs from the CGNAT-mapped external port).
-// When the callback returns a non-empty string, it replaces the peer's
-// STUN-reported PublicEndpoint in findNode responses.
-func (d *DHT) SetEndpointOverride(fn func(pubkey string) string) {
-	d.endpointOverride = fn
-	if fn != nil {
-		d.log.Info("dht endpoint override installed (hub authoritative endpoints)")
-	}
 }
 
 func (d *DHT) acceptLoop() {
@@ -186,7 +229,6 @@ func (d *DHT) acceptLoop() {
 }
 
 func (d *DHT) handleConn(conn net.Conn) {
-	defer conn.Close()
 	dec := gob.NewDecoder(conn)
 	var msg DhtMessage
 	if err := dec.Decode(&msg); err != nil {
@@ -194,13 +236,69 @@ func (d *DHT) handleConn(conn net.Conn) {
 		return
 	}
 	switch msg.Type {
+	case MsgControlHello:
+		if msg.PublicKey != "" {
+			d.controlMu.Lock()
+			d.controlConns[msg.PublicKey] = conn
+			d.controlMu.Unlock()
+		}
+		// Keep this connection open; the peer owns the writer side.
+		select {
+		case <-d.stopCh:
+		case <-time.After(24 * time.Hour):
+		}
+		return
 	case MsgFindNode:
 		d.handleFindNode(conn, &msg)
 	case MsgPing:
 		d.handlePing(conn)
 	case MsgReportState:
 		d.handleReportState(&msg)
+	case MsgPunchPlan:
+		if d.onPunchPlan != nil {
+			d.onPunchPlan(msg)
+		}
 	}
+}
+
+// SendPunchPlan sends the same future start time and candidate-port window to
+// a peer over the existing DHT control channel. The caller should send the
+// identical plan to both participants; start time is Unix milliseconds.
+func (d *DHT) SendPunchPlan(contact Contact, targetPublicKey, targetEndpoint, punchID string, start time.Time, window time.Duration, ports []string) error {
+	d.controlMu.Lock()
+	conn := d.controlConns[contact.PublicKey]
+	d.controlMu.Unlock()
+	if conn != nil {
+		msg := DhtMessage{Type: MsgPunchPlan, SenderID: d.table.selfID, PublicKey: d.publicKey, TargetPublicKey: targetPublicKey, WgEndpoint: targetEndpoint, PunchID: punchID, PunchStartUnix: start.UnixMilli(), PunchWindowMs: int(window / time.Millisecond), PunchPorts: append([]string(nil), ports...)}
+		return gob.NewEncoder(conn).Encode(msg)
+	}
+	control := contact.ControlEndpoint
+	if control == "" {
+		control = contact.Endpoint
+	}
+	if control == "" {
+		return fmt.Errorf("punch plan: empty peer endpoint")
+	}
+	conn, err := net.DialTimeout("tcp", control, 5*time.Second)
+	if err != nil {
+		return fmt.Errorf("punch plan connect: %w", err)
+	}
+	defer conn.Close()
+	msg := DhtMessage{
+		Type:            MsgPunchPlan,
+		SenderID:        d.table.selfID,
+		PublicKey:       d.publicKey,
+		PunchID:         punchID,
+		TargetPublicKey: targetPublicKey,
+		WgEndpoint:      targetEndpoint,
+		PunchStartUnix:  start.UnixMilli(),
+		PunchWindowMs:   int(window / time.Millisecond),
+		PunchPorts:      append([]string(nil), ports...),
+	}
+	if err := gob.NewEncoder(conn).Encode(msg); err != nil {
+		return fmt.Errorf("punch plan encode: %w", err)
+	}
+	return nil
 }
 
 func (d *DHT) handleFindNode(conn net.Conn, msg *DhtMessage) {
@@ -210,10 +308,16 @@ func (d *DHT) handleFindNode(conn net.Conn, msg *DhtMessage) {
 		ep = conn.RemoteAddr().String()
 	}
 	contact := Contact{
-		ID:             msg.SenderID,
-		PublicKey:      msg.PublicKey,
-		Endpoint:       ep,
-		PublicEndpoint: msg.PublicEndpoint,
+		ID:              msg.SenderID,
+		PublicKey:       msg.PublicKey,
+		Endpoint:        ep,
+		PublicEndpoint:  msg.PublicEndpoint,
+		ControlEndpoint: msg.ControlEndpoint,
+	}
+	if d.observedEndpoint != nil {
+		if observed := d.observedEndpoint(msg.PublicKey); observed != "" {
+			contact.PublicEndpoint = observed
+		}
 	}
 	d.table.insert(contact)
 	// Fire callback on the responder side (hub) so peer registrations are visible
@@ -226,26 +330,6 @@ func (d *DHT) handleFindNode(conn net.Conn, msg *DhtMessage) {
 		d.onPeerDiscovered(contact)
 	}
 	closest := d.table.closest(msg.TargetID, kBucketSize)
-	// When this node is the hub (or otherwise observes peers' real WG
-	// endpoints), replace STUN-reported public endpoints with the
-	// authoritative endpoints seen on the WireGuard interface. This fixes
-	// CGNAT cases where STUN reports the internal port instead of the
-	// actual external mapping.
-	if d.endpointOverride != nil {
-		for i := range closest {
-			if closest[i].PublicKey == "" {
-				continue
-			}
-			if ov := d.endpointOverride(closest[i].PublicKey); ov != "" && ov != closest[i].PublicEndpoint {
-				d.log.Debug("dht overriding peer public endpoint",
-					"pk", closest[i].PublicKey[:16],
-					"old", closest[i].PublicEndpoint,
-					"new", ov,
-				)
-				closest[i].PublicEndpoint = ov
-			}
-		}
-	}
 	resp := DhtMessage{Type: MsgFindNodeResp, SenderID: d.table.selfID, Contacts: closest}
 	enc := gob.NewEncoder(conn)
 	enc.Encode(resp)
@@ -367,6 +451,14 @@ func (d *DHT) findNode(targetID string, contact Contact) {
 		PublicKey:      d.publicKey,
 		WgEndpoint:     d.wgEndpoint,
 		PublicEndpoint: d.publicEndpoint,
+	}
+	// Advertise the DHT TCP address separately from the WireGuard UDP endpoint.
+	// A TCP connection's RemoteAddr is an ephemeral client port and cannot be
+	// used by the hub to send a later punch plan.
+	if _, host, err := net.SplitHostPort(d.publicEndpoint); err == nil && host != "" {
+		if tcpAddr, ok := d.listener.Addr().(*net.TCPAddr); ok {
+			msg.ControlEndpoint = net.JoinHostPort(host, strconv.Itoa(tcpAddr.Port))
+		}
 	}
 	enc := gob.NewEncoder(conn)
 	if err := enc.Encode(msg); err != nil {
